@@ -11,10 +11,29 @@ Hooks are written to .claude/settings.json so Claude Code loads them automatical
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 from orchestra.store import Store
+
+
+BEADS_DIR = Path.home() / ".orchestra" / "orchestrator-workspace" / ".beads"
+MAYUSHII_ROOT = Path(__file__).parent.parent
+
+
+def _beads_env() -> dict[str, str]:
+    """Return env dict with BEADS_DIR set so bd commands find the database."""
+    env = os.environ.copy()
+    beads_dir = BEADS_DIR
+    if not beads_dir.exists():
+        mayushii_beads = MAYUSHII_ROOT / ".beads"
+        if mayushii_beads.exists():
+            beads_dir = mayushii_beads
+    if beads_dir.exists():
+        env["BEADS_DIR"] = str(beads_dir)
+    return env
 
 
 def generate_hooks_config(task_id: str) -> dict:
@@ -133,6 +152,7 @@ def handle_session_start(task_id: str) -> str:
         result = subprocess.run(
             ["bd", "show", task_id, "--json"],
             capture_output=True, text=True, check=False,
+            env=_beads_env(),
         )
         if result.returncode == 0:
             task_data = json.loads(result.stdout)
@@ -190,6 +210,7 @@ def handle_stop(task_id: str) -> None:
         result = subprocess.run(
             ["bd", "show", task_id, "--json"],
             capture_output=True, text=True, check=False,
+            env=_beads_env(),
         )
         if result.returncode == 0:
             task_data = json.loads(result.stdout)
@@ -207,13 +228,17 @@ def handle_stop(task_id: str) -> None:
     # Update SQLite
     store.update_session_status(task_id, status)
 
-    # Signal orchestrator via tmux
+    # Signal orchestrator via tmux — critical path, don't silently swallow failures
     if session.orchestrator_id:
         orch = store.get_orchestrator(session.orchestrator_id)
         if orch:
             from orchestra import tmux
             target = f"{orch.tmux_session}:orchestrator"
-            try:
-                tmux.send_command(target, f"[Worker {task_id}]: {status} — {reason}")
-            except Exception:
-                pass
+            if tmux.session_exists(orch.tmux_session):
+                windows = {w.name for w in tmux.list_windows(orch.tmux_session)}
+                if "orchestrator" in windows:
+                    tmux.send_command(target, f"[Worker {task_id}]: {status} — {reason}")
+                else:
+                    print(f"[orchestra] WARNING: orchestrator window gone, completion signal for {task_id} lost", file=sys.stderr)
+            else:
+                print(f"[orchestra] WARNING: tmux session {orch.tmux_session} gone, completion signal for {task_id} lost", file=sys.stderr)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -104,39 +105,49 @@ def select_skills_via_llm(
     try:
         import anthropic
     except ImportError:
+        print("[orchestra] WARNING: anthropic SDK not installed, cannot select skills via LLM", file=sys.stderr)
         return []
 
     catalog_text = format_catalog_for_llm(catalog)
     if not catalog_text:
         return []
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=256,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"You are selecting skills for an AI agent.\n\n"
-                f"Task: {task_description}\n"
-                f"Agent role: {role}\n"
-                f"Max skills: {max_skills}\n\n"
-                f"Available skills:\n{catalog_text}\n\n"
-                f"Return ONLY a JSON array of skill names. Example: [\"debug\", \"backend\"]\n"
-                f"Pick only skills directly relevant to this task and role."
-            ),
-        }],
-    )
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are selecting skills for an AI agent.\n\n"
+                    f"Task: {task_description}\n"
+                    f"Agent role: {role}\n"
+                    f"Max skills: {max_skills}\n\n"
+                    f"Available skills:\n{catalog_text}\n\n"
+                    f"Return ONLY a JSON array of skill names. Example: [\"debug\", \"backend\"]\n"
+                    f"Pick only skills directly relevant to this task and role."
+                ),
+            }],
+        )
+    except Exception as e:
+        print(f"[orchestra] WARNING: LLM skill selection failed: {e}", file=sys.stderr)
+        return []
 
     text = response.content[0].text.strip()
     match = re.search(r"\[.*?\]", text, re.DOTALL)
     if not match:
+        print(f"[orchestra] WARNING: LLM returned non-JSON skill selection: {text[:100]}", file=sys.stderr)
         return []
 
     try:
         names = json.loads(match.group())
         valid = {s.name for s in catalog}
-        return [n for n in names if n in valid][:max_skills]
+        selected = [n for n in names if n in valid][:max_skills]
+        rejected = [n for n in names if n not in valid]
+        if rejected:
+            print(f"[orchestra] WARNING: LLM selected unknown skills (ignored): {rejected}", file=sys.stderr)
+        return selected
     except (json.JSONDecodeError, TypeError):
         return []
 
@@ -148,9 +159,15 @@ def inject_skills(workspace: Path, skill_names: list[str], skills_repo: Path | N
     skills_dir.mkdir(parents=True, exist_ok=True)
 
     injected: list[Path] = []
+    repo_resolved = repo.resolve()
     for name in skill_names:
         src = repo / name
         if not src.exists():
+            print(f"[orchestra] WARNING: skill '{name}' not found at {src}", file=sys.stderr)
+            continue
+        # Validate path stays within skills repo (prevent traversal)
+        if not src.resolve().is_relative_to(repo_resolved):
+            print(f"[orchestra] WARNING: skill '{name}' escapes skills repo, skipping", file=sys.stderr)
             continue
         dst = skills_dir / name
         if dst.exists() or dst.is_symlink():

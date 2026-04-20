@@ -21,6 +21,7 @@ Commands:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -32,7 +33,7 @@ from rich.panel import Panel
 
 from orchestra.store import Store, MessageDirection
 from orchestra import tmux, lifecycle, skills
-from orchestra.hooks import handle_session_start, handle_heartbeat, handle_stop
+from orchestra.hooks import handle_session_start, handle_heartbeat, handle_stop, _beads_env
 
 app = typer.Typer(name="orchestra", help="AI Agent Orchestrator — beads + tmux + Claude Code")
 worker_app = typer.Typer(name="worker", help="Manage worker agents")
@@ -95,14 +96,33 @@ def start(
     if orch_skill_src.exists():
         skill_dst.write_text(orch_skill_src.read_text())
 
+    # Ensure beads DB is accessible from workspace
+    mayushii_root = Path(__file__).parent.parent
+    mayushii_beads = mayushii_root / ".beads"
+    workspace_beads = workspace / ".beads"
+    if mayushii_beads.exists() and not workspace_beads.exists():
+        workspace_beads.symlink_to(mayushii_beads)
+
+    # Also symlink .dolt and .doltcfg if present (beads needs these)
+    for dolt_dir in (".dolt", ".doltcfg"):
+        src = mayushii_root / dolt_dir
+        dst = workspace / dolt_dir
+        if src.exists() and not dst.exists():
+            dst.symlink_to(src)
+
     # 2. Create tmux session
     tmux.create_session(session_name, first_window="orchestrator")
     orch = store.create_orchestrator(session_name)
     target = f"{session_name}:orchestrator"
 
-    # cd into workspace, then launch Claude
+    # cd into workspace, then set BEADS_DIR and launch Claude
     tmux.send_command(target, f"cd {workspace}")
     time.sleep(0.5)
+
+    # Export BEADS_DIR so bd commands work
+    if mayushii_beads.exists():
+        tmux.send_command(target, f"export BEADS_DIR={mayushii_beads}")
+        time.sleep(0.3)
 
     claude_cmd = f"claude --model {model} --dangerously-skip-permissions"
     tmux.send_command(target, claude_cmd)

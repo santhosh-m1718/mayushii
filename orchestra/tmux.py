@@ -54,7 +54,7 @@ def kill_session(session: str) -> None:
 
 def create_window(session: str, name: str, cwd: str | None = None) -> str:
     """Create a new window, return the target string."""
-    args = ["new-window", "-t", session, "-n", name]
+    args = ["new-window", "-a", "-t", session, "-n", name]
     if cwd:
         args += ["-c", cwd]
     _run(args, check=True)

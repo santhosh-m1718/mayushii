@@ -161,9 +161,6 @@ class Store:
     # --- Orchestrators ---
 
     def create_orchestrator(self, tmux_session: str) -> Orchestrator:
-        with self._conn() as conn:
-            conn.execute("DELETE FROM orchestrators WHERE tmux_session = ?", (tmux_session,))
-
         orch = Orchestrator(
             id=_new_id(),
             tmux_session=tmux_session,
@@ -171,6 +168,16 @@ class Store:
             started_at=time.time(),
         )
         with self._conn() as conn:
+            # Cascade: clean up sessions tied to the old orchestrator
+            old = conn.execute(
+                "SELECT id FROM orchestrators WHERE tmux_session = ?", (tmux_session,)
+            ).fetchone()
+            if old:
+                conn.execute(
+                    "UPDATE sessions SET status = 'stopped', stopped_at = ? WHERE orchestrator_id = ? AND status IN ('starting', 'running')",
+                    (time.time(), old["id"]),
+                )
+                conn.execute("DELETE FROM orchestrators WHERE id = ?", (old["id"],))
             conn.execute(
                 "INSERT INTO orchestrators (id, tmux_session, status, started_at) VALUES (?, ?, ?, ?)",
                 (orch.id, orch.tmux_session, orch.status, orch.started_at),
@@ -222,6 +229,14 @@ class Store:
             last_seen=now,
         )
         with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT status FROM sessions WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing and existing["status"] in ("starting", "running"):
+                raise ValueError(
+                    f"Session {task_id} already active (status={existing['status']}). "
+                    "Stop it first with `orchestra worker stop`."
+                )
             conn.execute(
                 """INSERT OR REPLACE INTO sessions
                    (task_id, tmux_session, window_name, role, skills, orchestrator_id, status, started_at, last_seen)

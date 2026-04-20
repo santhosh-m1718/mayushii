@@ -9,6 +9,7 @@ This is the core engine. It:
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
@@ -21,6 +22,14 @@ from orchestra.hooks import write_workspace_settings, write_workspace_claude_md
 ORCHESTRA_HOME = Path.home() / ".orchestra"
 WORKSPACES_DIR = ORCHESTRA_HOME / "workspaces"
 ROLES_DIR = Path(__file__).parent.parent / "roles"
+
+MAX_TMUX_MESSAGE_LEN = 4096
+
+
+def _sanitize_window_name(name: str) -> str:
+    """Strip characters that break tmux window names (dots, colons, etc.)."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+    return safe[:60]
 
 
 def _load_role_prompt(role: str) -> str:
@@ -83,8 +92,8 @@ def start_worker(
     # Install hooks (call back into orchestra CLI, not inline bash)
     write_workspace_settings(workspace, task_id)
 
-    # Window name: role-taskid (short enough for tmux)
-    window_name = f"{role}-{task_id}"
+    # Window name: role-taskid (sanitized for tmux safety)
+    window_name = _sanitize_window_name(f"{role}-{task_id}")
 
     # Record in SQLite BEFORE launching (so hooks can find the session)
     session = store.put_session(
@@ -117,7 +126,7 @@ def start_worker(
     return session
 
 
-def stop_worker(store: Store, task_id: str) -> None:
+def stop_worker(store: Store, task_id: str, cleanup: bool = True) -> None:
     """Gracefully stop a worker — Ctrl-C, wait, then kill window."""
     session = store.get_session(task_id)
     if not session:
@@ -125,18 +134,23 @@ def stop_worker(store: Store, task_id: str) -> None:
 
     target = session.tmux_target
 
-    # Graceful: Ctrl-C
-    tmux.send_interrupt(target)
-
-    # Give it a moment
-    import time
-    time.sleep(3)
-
-    # Kill the window
-    tmux.kill_window(session.tmux_session, session.window_name)
+    # Only interact with tmux if the session still exists
+    if tmux.session_exists(session.tmux_session):
+        windows = {w.name for w in tmux.list_windows(session.tmux_session)}
+        if session.window_name in windows:
+            tmux.send_interrupt(target)
+            import time
+            time.sleep(3)
+            tmux.kill_window(session.tmux_session, session.window_name)
 
     # Update state
     store.update_session_status(task_id, "stopped")
+
+    # Clean up workspace (only if it's our managed workspace, not a user repo)
+    if cleanup:
+        workspace = WORKSPACES_DIR / task_id
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def send_message(
@@ -157,6 +171,10 @@ def send_message(
         raise ValueError(f"No active session for task {task_id}")
 
     target = session.tmux_target
+
+    # Truncate oversized messages that could overflow tmux
+    if len(content) > MAX_TMUX_MESSAGE_LEN:
+        content = content[:MAX_TMUX_MESSAGE_LEN] + "\n... [truncated]"
 
     # Record the message
     store.put_message(task_id, MessageDirection.TO_WORKER, msg_type, content)
@@ -204,7 +222,7 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
     """Sync worker states with actual tmux window state.
 
     If a tmux window is gone but the session is still 'running',
-    mark it as done/failed.
+    check beads to determine if it completed or failed.
     """
     sessions = store.list_running_sessions(orchestrator_id)
     if not sessions:
@@ -214,8 +232,33 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
     if not orch:
         return
 
+    if not tmux.session_exists(orch.tmux_session):
+        for session in sessions:
+            store.update_session_status(session.task_id, "stopped")
+        return
+
     windows = {w.name for w in tmux.list_windows(orch.tmux_session)}
 
     for session in sessions:
         if session.window_name not in windows:
-            store.update_session_status(session.task_id, "done")
+            # Check beads to see if the task was properly closed
+            import subprocess
+            from orchestra.hooks import _beads_env
+            try:
+                result = subprocess.run(
+                    ["bd", "show", session.task_id, "--json"],
+                    capture_output=True, text=True, check=False,
+                    env=_beads_env(),
+                )
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout)
+                    if isinstance(data, list):
+                        data = data[0]
+                    if data.get("status") == "closed":
+                        store.update_session_status(session.task_id, "done")
+                        continue
+            except Exception:
+                pass
+            # Window gone but task not closed = unexpected exit
+            store.update_session_status(session.task_id, "failed")
