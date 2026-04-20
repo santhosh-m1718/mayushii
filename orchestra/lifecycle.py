@@ -109,6 +109,10 @@ def start_worker(
     # Create tmux window in the orchestrator's session
     target = tmux.create_window(orch_session, window_name, cwd=str(workspace))
 
+    # Wait for shell to be ready in the new tmux window
+    tmux.wait_for_ready(target, sentinel="$", timeout=5)
+    tmux.wait_for_ready(target, sentinel="%", timeout=3)
+
     # Launch Claude Code with model
     tmux.send_command(target, f"claude --model {model} --dangerously-skip-permissions")
 

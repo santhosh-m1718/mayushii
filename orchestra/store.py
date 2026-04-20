@@ -168,15 +168,22 @@ class Store:
             started_at=time.time(),
         )
         with self._conn() as conn:
-            # Cascade: clean up sessions tied to the old orchestrator
+            # Cascade: clean up all sessions and messages tied to the old orchestrator
             old = conn.execute(
                 "SELECT id FROM orchestrators WHERE tmux_session = ?", (tmux_session,)
             ).fetchone()
             if old:
+                # Stop any active sessions
                 conn.execute(
                     "UPDATE sessions SET status = 'stopped', stopped_at = ? WHERE orchestrator_id = ? AND status IN ('starting', 'running')",
                     (time.time(), old["id"]),
                 )
+                # Delete messages for old sessions, then delete sessions, then orchestrator
+                conn.execute(
+                    "DELETE FROM messages WHERE task_id IN (SELECT task_id FROM sessions WHERE orchestrator_id = ?)",
+                    (old["id"],),
+                )
+                conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?", (old["id"],))
                 conn.execute("DELETE FROM orchestrators WHERE id = ?", (old["id"],))
             conn.execute(
                 "INSERT INTO orchestrators (id, tmux_session, status, started_at) VALUES (?, ?, ?, ?)",

@@ -1,6 +1,6 @@
 [project]
 name = "orchestra"
-version = "0.5.0"
+version = "0.5.1"
 description = "AI Agent Orchestrator — beads task DAG, tmux sessions, Claude Code workers"
 readme = "README.md"
 requires-python = ">=3.12"

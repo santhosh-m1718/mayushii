@@ -111,9 +111,18 @@ def start(
             dst.symlink_to(src)
 
     # 2. Create tmux session
+    # Kill any stale session first so we get a clean start
+    if tmux.session_exists(session_name):
+        tmux.kill_session(session_name)
     tmux.create_session(session_name, first_window="orchestrator")
     orch = store.create_orchestrator(session_name)
     target = f"{session_name}:orchestrator"
+
+    # Wait for shell to be ready before sending any commands
+    console.print("[dim]Waiting for shell...[/]")
+    if not tmux.wait_for_ready(target, sentinel="$", timeout=10):
+        # Try common prompts — zsh uses %, bash uses $, custom might use ❯
+        tmux.wait_for_ready(target, sentinel="%", timeout=5)
 
     # cd into workspace, then set BEADS_DIR and launch Claude
     tmux.send_command(target, f"cd {workspace}")
@@ -124,6 +133,7 @@ def start(
         tmux.send_command(target, f"export BEADS_DIR={mayushii_beads}")
         time.sleep(0.3)
 
+    console.print("[dim]Launching Claude Code...[/]")
     claude_cmd = f"claude --model {model} --dangerously-skip-permissions"
     tmux.send_command(target, claude_cmd)
 
