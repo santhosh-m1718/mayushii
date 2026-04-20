@@ -58,7 +58,7 @@ def start(
     session_name: str = typer.Option("orchestra", "--name", "-n", help="tmux session name"),
     prompt: str = typer.Option("", "--prompt", "-p", help="Initial prompt for orchestrator"),
     model: str = typer.Option("claude-opus-4-6", "--model", "-m", help="Claude model to use"),
-    repo: str = typer.Option("", "--repo", "-r", help="Target repository path for workers"),
+    repo: str = typer.Option("", "--repo", "-r", help="Target repository path (default: orchestra source dir)"),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't auto-attach to tmux"),
 ) -> None:
     """Start the orchestrator — creates tmux session, launches Claude Code, and attaches you."""
@@ -68,80 +68,79 @@ def start(
         subprocess.run(["tmux", "attach-session", "-t", existing.tmux_session])
         return
 
-    # 1. Set up orchestrator workspace
-    workspace = Path.home() / ".orchestra" / "orchestrator-workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
+    # Resolve target repo — stored in ~/.orchestra/default-repo for persistence
+    default_repo_file = Path.home() / ".orchestra" / "default-repo"
+    if repo:
+        repo_path = Path(repo).resolve()
+        # Remember for next time
+        default_repo_file.parent.mkdir(parents=True, exist_ok=True)
+        default_repo_file.write_text(str(repo_path))
+    elif default_repo_file.exists():
+        repo_path = Path(default_repo_file.read_text().strip())
+    else:
+        console.print("[red]No repo specified. Run with --repo /path/to/orchestra first time.[/]")
+        console.print("[dim]Subsequent runs will remember the path.[/]")
+        raise typer.Exit(1)
 
-    # Write CLAUDE.md from orchestrator SKILL.md
-    orch_skill_src = Path(__file__).parent.parent / "orchestrator" / "SKILL.md"
-    skill_content = ""
+    if not repo_path.exists():
+        console.print(f"[red]Repo path does not exist: {repo_path}[/]")
+        raise typer.Exit(1)
+
+    # 1. Inject orchestrator skill into the target repo's .claude/skills/
+    orch_skill_src = repo_path / "orchestrator" / "SKILL.md"
+    if orch_skill_src.exists():
+        skills_dir = repo_path / ".claude" / "skills" / "orchestrator"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        skill_dst = skills_dir / "SKILL.md"
+        if skill_dst.exists() or skill_dst.is_symlink():
+            skill_dst.unlink()
+        skill_dst.write_text(orch_skill_src.read_text())
+
+    # Write orchestrator CLAUDE.md into the repo
+    # (preserves any existing one by writing to a known location)
+    orch_claude_md = repo_path / "CLAUDE.md"
+    orch_skill_content = ""
     if orch_skill_src.exists():
         raw = orch_skill_src.read_text()
         parts = raw.split("---", 2)
-        skill_content = parts[2].strip() if len(parts) >= 3 else raw
+        orch_skill_content = parts[2].strip() if len(parts) >= 3 else raw
 
-    # Resolve the target repo path
-    repo_path = Path(repo).resolve() if repo else Path.cwd()
+    # Back up existing CLAUDE.md if present
+    backup_path = repo_path / ".claude" / "CLAUDE.md.orchestra-backup"
+    if orch_claude_md.exists():
+        existing_content = orch_claude_md.read_text()
+        if "You are Mayushii" not in existing_content:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_text(existing_content)
 
-    claude_md = workspace / "CLAUDE.md"
-    claude_md.write_text(
+    orch_claude_md.write_text(
         "# Orchestra — AI Agent Orchestrator\n\n"
         "You are Mayushii, an AI orchestrator that coordinates worker agents.\n"
         "You have access to `bd` (beads) for task management and `orchestra` CLI for worker management.\n\n"
         f"## Target Repository\n"
-        f"**IMPORTANT**: All workers MUST target this repo: `{repo_path}`\n"
-        f"When launching workers, ALWAYS pass `--repo {repo_path}`:\n"
-        f"```\norchestra worker start <task-id> --role explore --repo {repo_path}\n```\n\n"
-        f"{skill_content}\n"
+        f"You are running in: `{repo_path}`\n"
+        f"All `bd` commands work from this directory.\n"
+        f"When launching workers, ALWAYS pass `--repo {repo_path}`.\n\n"
+        f"{orch_skill_content}\n"
     )
 
-    # Symlink orchestrator skill
-    skills_dir = workspace / ".claude" / "skills" / "orchestrator"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    skill_dst = skills_dir / "SKILL.md"
-    if skill_dst.exists() or skill_dst.is_symlink():
-        skill_dst.unlink()
-    if orch_skill_src.exists():
-        skill_dst.write_text(orch_skill_src.read_text())
-
-    # Ensure beads DB is accessible from workspace
-    mayushii_root = Path(__file__).parent.parent
-    mayushii_beads = mayushii_root / ".beads"
-    workspace_beads = workspace / ".beads"
-    if mayushii_beads.exists() and not workspace_beads.exists():
-        workspace_beads.symlink_to(mayushii_beads)
-
-    # Also symlink .dolt and .doltcfg if present (beads needs these)
-    for dolt_dir in (".dolt", ".doltcfg"):
-        src = mayushii_root / dolt_dir
-        dst = workspace / dolt_dir
-        if src.exists() and not dst.exists():
-            dst.symlink_to(src)
-
     # 2. Create tmux session
-    # Kill any stale session first so we get a clean start
     if tmux.session_exists(session_name):
         tmux.kill_session(session_name)
     tmux.create_session(session_name, first_window="orchestrator")
     orch = store.create_orchestrator(session_name)
     target = f"{session_name}:orchestrator"
 
-    # Wait for shell to be ready before sending any commands
+    # Wait for shell to be ready
     console.print("[dim]Waiting for shell...[/]")
     if not tmux.wait_for_ready(target, sentinel="$", timeout=10):
-        # Try common prompts — zsh uses %, bash uses $, custom might use ❯
         tmux.wait_for_ready(target, sentinel="%", timeout=5)
 
-    # cd into workspace, then set BEADS_DIR and launch Claude
-    tmux.send_command(target, f"cd {workspace}")
+    # cd into the target repo (where bd and .beads/ live)
+    tmux.send_command(target, f"cd {repo_path}")
     time.sleep(0.5)
 
-    # Export BEADS_DIR so bd commands work
-    if mayushii_beads.exists():
-        tmux.send_command(target, f"export BEADS_DIR={mayushii_beads}")
-        time.sleep(0.3)
-
-    console.print("[dim]Launching Claude Code...[/]")
+    console.print(f"[dim]Launching Claude Code in {repo_path}...[/]")
     claude_cmd = f"claude --model {model} --dangerously-skip-permissions"
     tmux.send_command(target, claude_cmd)
 
@@ -169,6 +168,26 @@ def stop() -> None:
 
     tmux.kill_session(orch.tmux_session)
     store.stop_orchestrator(orch.id)
+
+    # Restore backed-up CLAUDE.md if present
+    default_repo_file = Path.home() / ".orchestra" / "default-repo"
+    repo_path = Path(default_repo_file.read_text().strip()) if default_repo_file.exists() else None
+    if not repo_path:
+        console.print("[green]Orchestrator stopped.[/]")
+        return
+    backup_path = repo_path / ".claude" / "CLAUDE.md.orchestra-backup"
+    claude_md = repo_path / "CLAUDE.md"
+    if backup_path.exists():
+        claude_md.write_text(backup_path.read_text())
+        backup_path.unlink()
+        console.print("[dim]Restored original CLAUDE.md[/]")
+
+    # Clean up injected orchestrator skill
+    injected_skill = repo_path / ".claude" / "skills" / "orchestrator"
+    if injected_skill.exists():
+        import shutil
+        shutil.rmtree(injected_skill)
+
     console.print("[green]Orchestrator stopped.[/]")
 
 

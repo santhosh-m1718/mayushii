@@ -21,7 +21,18 @@ from orchestra.hooks import write_workspace_settings, write_workspace_claude_md
 
 ORCHESTRA_HOME = Path.home() / ".orchestra"
 WORKSPACES_DIR = ORCHESTRA_HOME / "workspaces"
-ROLES_DIR = Path(__file__).parent.parent / "roles"
+
+
+def _get_repo_path() -> Path:
+    """Get the orchestra repo path from stored config."""
+    default_repo_file = ORCHESTRA_HOME / "default-repo"
+    if default_repo_file.exists():
+        return Path(default_repo_file.read_text().strip())
+    return Path(__file__).parent.parent
+
+
+def _get_roles_dir() -> Path:
+    return _get_repo_path() / "roles"
 
 MAX_TMUX_MESSAGE_LEN = 4096
 
@@ -34,7 +45,7 @@ def _sanitize_window_name(name: str) -> str:
 
 def _load_role_prompt(role: str) -> str:
     """Load a role prompt template from roles/<role>.md"""
-    role_file = ROLES_DIR / f"{role}.md"
+    role_file = _get_roles_dir() / f"{role}.md"
     if role_file.exists():
         return role_file.read_text()
     return f"You are a {role} agent. Complete your assigned task thoroughly."

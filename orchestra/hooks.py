@@ -19,18 +19,19 @@ from pathlib import Path
 from orchestra.store import Store
 
 
-BEADS_DIR = Path.home() / ".orchestra" / "orchestrator-workspace" / ".beads"
-MAYUSHII_ROOT = Path(__file__).parent.parent
+def _get_repo_path() -> Path:
+    """Get the orchestra repo path from stored config."""
+    default_repo_file = Path.home() / ".orchestra" / "default-repo"
+    if default_repo_file.exists():
+        return Path(default_repo_file.read_text().strip())
+    return Path(__file__).parent.parent
 
 
 def _beads_env() -> dict[str, str]:
     """Return env dict with BEADS_DIR set so bd commands find the database."""
     env = os.environ.copy()
-    beads_dir = BEADS_DIR
-    if not beads_dir.exists():
-        mayushii_beads = MAYUSHII_ROOT / ".beads"
-        if mayushii_beads.exists():
-            beads_dir = mayushii_beads
+    repo = _get_repo_path()
+    beads_dir = repo / ".beads"
     if beads_dir.exists():
         env["BEADS_DIR"] = str(beads_dir)
     return env
