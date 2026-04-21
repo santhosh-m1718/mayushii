@@ -12,11 +12,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from mayushii.store import Store
+
+
+_TASK_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def _validate_task_id(task_id: str) -> str:
+    """Validate task_id before embedding in shell commands or file paths."""
+    if not _TASK_ID_RE.match(task_id) or ".." in task_id:
+        raise ValueError(f"Invalid task_id for hook: '{task_id}'")
+    return task_id
 
 
 def _get_repo_path() -> Path:
@@ -39,6 +50,7 @@ def _beads_env() -> dict[str, str]:
 
 def generate_hooks_config(task_id: str) -> dict:
     """Generate .claude/settings.json hooks that call back into mayushii CLI."""
+    _validate_task_id(task_id)
     return {
         "hooks": {
             "SessionStart": [
@@ -97,6 +109,11 @@ def generate_claude_md(role: str, task_id: str, role_prompt: str, context: str =
     sections = [
         f"# Worker Agent — {role.title()}",
         "",
+        "## CRITICAL: You MUST close your task when done",
+        f"When you finish your work, you MUST run: `bd close {task_id} --reason \"<summary of what you found/did>\"`",
+        "This is your #1 obligation. Do NOT stop, go idle, or wait after finishing — close the task immediately.",
+        "If you don't close the task, the orchestrator will never know you finished.",
+        "",
         "## Your Task",
         f"Run `bd show {task_id}` to see your full task details.",
         "",
@@ -112,10 +129,6 @@ def generate_claude_md(role: str, task_id: str, role_prompt: str, context: str =
         ])
 
     sections.extend([
-        "",
-        "## When Done",
-        f"Close your task with a summary: `bd close {task_id} --reason \"<what you did>\"`",
-        "The orchestrator will be notified automatically via hooks.",
         "",
         "## If Blocked",
         f"`bd update {task_id} --status blocked --append-notes \"BLOCKED: <describe the issue>\"`",
@@ -152,8 +165,11 @@ def write_worker_prompt(
     context: str = "",
 ) -> Path:
     """Write worker prompt to ~/.mayushii/prompts/<task-id>.md instead of repo's CLAUDE.md."""
+    _validate_task_id(task_id)
     PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
     prompt_path = PROMPTS_DIR / f"{task_id}.md"
+    if not prompt_path.resolve().is_relative_to(PROMPTS_DIR.resolve()):
+        raise ValueError(f"Task ID '{task_id}' would escape prompts directory")
     content = generate_claude_md(role, task_id, role_prompt, context)
     prompt_path.write_text(content)
     return prompt_path
@@ -161,7 +177,10 @@ def write_worker_prompt(
 
 def cleanup_worker_prompt(task_id: str) -> None:
     """Remove a worker's prompt file."""
+    _validate_task_id(task_id)
     prompt_path = PROMPTS_DIR / f"{task_id}.md"
+    if not prompt_path.resolve().is_relative_to(PROMPTS_DIR.resolve()):
+        return
     if prompt_path.exists():
         prompt_path.unlink()
 
@@ -250,8 +269,9 @@ def handle_stop(task_id: str) -> None:
     except Exception:
         reason = "session ended (could not check beads)"
 
-    # Update SQLite
-    store.update_session_status(task_id, status)
+    # Atomically transition status; skip if already terminal (prevents duplicate signals)
+    if not store.try_terminal_transition(task_id, status):
+        return
 
     # Signal orchestrator via tmux — critical path, don't silently swallow failures
     if session.orchestrator_id:

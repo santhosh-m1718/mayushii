@@ -165,18 +165,7 @@ def start_worker(
     # Window name: role-taskid (sanitized for tmux safety)
     window_name = _sanitize_window_name(f"{role}-{task_id}")
 
-    # Record in SQLite BEFORE launching (so hooks can find the session)
-    session = store.put_session(
-        task_id=task_id,
-        orchestrator_id=orchestrator_id,
-        tmux_session=orch_session,
-        window_name=window_name,
-        role=role,
-        skills=",".join(skills),
-        status="starting",
-    )
-
-    # Create tmux window in the orchestrator's session
+    # Create tmux window BEFORE recording in SQLite — avoids stranded 'starting' rows on tmux failure
     target = tmux.create_window(orch_session, window_name, cwd=str(workspace))
 
     # Wait for shell to be ready in the new tmux window
@@ -186,11 +175,31 @@ def start_worker(
     # Explicitly cd into workspace (shell profile may override tmux -c cwd)
     tmux.send_command(target, f'cd "{workspace}"')
 
+    # Record in SQLite now that the tmux window exists; kill window if DB insert fails
+    try:
+        session = store.put_session(
+            task_id=task_id,
+            orchestrator_id=orchestrator_id,
+            tmux_session=orch_session,
+            window_name=window_name,
+            role=role,
+            skills=",".join(skills),
+            status="starting",
+        )
+    except Exception:
+        tmux.kill_window(orch_session, window_name)
+        raise
+
     # Launch Claude Code with model
     tmux.send_command(target, f"claude --model {model} --dangerously-skip-permissions")
 
     # Wait for Claude Code to be ready instead of fixed sleep
     ready = tmux.wait_for_ready(target, timeout=30)
+
+    if not ready:
+        tmux.kill_window(orch_session, window_name)
+        store.update_session_status(task_id, "failed")
+        raise RuntimeError(f"Claude Code failed to start for worker {task_id}")
 
     # Update status
     store.update_session_status(task_id, "running")
@@ -223,8 +232,10 @@ def stop_worker(store: Store, task_id: str, cleanup: bool = True) -> None:
             time.sleep(3)
             tmux.kill_window(session.tmux_session, session.window_name)
 
-    # Update state
-    store.update_session_status(task_id, "stopped")
+    # Only overwrite status if not already in a terminal state (hook may have set done/failed)
+    session = store.get_session(task_id)
+    if session and session.status not in ("done", "failed", "stopped"):
+        store.update_session_status(task_id, "stopped")
 
     # Clean up prompt file
     cleanup_worker_prompt(task_id)

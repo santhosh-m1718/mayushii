@@ -145,8 +145,9 @@ class Store:
         for sql in MIGRATIONS:
             try:
                 conn.execute(sql)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -286,6 +287,21 @@ class Store:
                     "UPDATE sessions SET status = ? WHERE task_id = ?",
                     (status, task_id),
                 )
+
+    def try_terminal_transition(self, task_id: str, new_status: str) -> bool:
+        """Atomically transition a session to a terminal status.
+
+        Returns True if the update happened (caller should proceed with signaling).
+        Returns False if already terminal (duplicate signal — skip).
+        """
+        now = time.time()
+        with self._conn() as conn:
+            result = conn.execute(
+                """UPDATE sessions SET status = ?, stopped_at = ?
+                   WHERE task_id = ? AND status NOT IN ('done', 'failed', 'stopped')""",
+                (new_status, now, task_id),
+            )
+            return result.rowcount > 0
 
     def touch_session(self, task_id: str) -> None:
         """Update last_seen timestamp — called by PostToolUse hook as heartbeat."""
