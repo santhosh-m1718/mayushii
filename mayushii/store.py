@@ -62,6 +62,7 @@ class Session:
     started_at: float
     stopped_at: float | None = None
     last_seen: float | None = None
+    last_nudged_at: float | None = None
 
     @property
     def tmux_target(self) -> str:
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at REAL NOT NULL,
     stopped_at REAL,
     last_seen REAL,
+    last_nudged_at REAL,
     UNIQUE(tmux_session, window_name)
 );
 
@@ -127,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_unacked ON messages(acked_at) WHERE acke
 
 MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN last_seen REAL",
+    "ALTER TABLE sessions ADD COLUMN last_nudged_at REAL",
 ]
 
 
@@ -309,6 +312,15 @@ class Store:
             conn.execute(
                 "UPDATE sessions SET last_seen = ? WHERE task_id = ?",
                 (time.time(), task_id),
+            )
+
+    def touch_nudge(self, task_id: str) -> None:
+        """Record that an idle nudge was sent, updating both last_seen and last_nudged_at."""
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_seen = ?, last_nudged_at = ? WHERE task_id = ?",
+                (now, now, task_id),
             )
 
     def list_sessions(self, orchestrator_id: str, status: str | None = None) -> list[Session]:

@@ -376,7 +376,8 @@ def list_workers(store: Store, orchestrator_id: str) -> list[Session]:
     return store.list_sessions(orchestrator_id)
 
 
-IDLE_NUDGE_THRESHOLD = 120  # seconds — nudge worker to close if idle this long
+IDLE_NUDGE_THRESHOLD = 300  # seconds — nudge worker to close if idle this long (Opus thinks for 60-90s+)
+IDLE_NUDGE_COOLDOWN = 300   # seconds — minimum time between consecutive nudges to the same worker
 
 
 def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
@@ -425,8 +426,11 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
             # Window gone but task not closed = unexpected exit
             store.update_session_status(session.task_id, "failed")
         elif session.idle_seconds > IDLE_NUDGE_THRESHOLD:
-            # Worker still alive but idle too long — nudge once, then reset
-            # the idle timer so we don't spam the same nudge every status check
+            # Worker still alive but idle too long — nudge if cooldown has elapsed
+            import time as _time
+            now = _time.time()
+            if session.last_nudged_at and (now - session.last_nudged_at) < IDLE_NUDGE_COOLDOWN:
+                continue
             target = session.tmux_target
             try:
                 tmux.send_command(
@@ -434,6 +438,6 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
                     f"You appear idle. If you are done, close your task NOW: "
                     f"`bd close {session.task_id} --reason \"<summary>\"`",
                 )
-                store.touch_session(session.task_id)
+                store.touch_nudge(session.task_id)
             except RuntimeError:
                 pass
