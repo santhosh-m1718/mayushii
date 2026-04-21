@@ -425,7 +425,8 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
             # Window gone but task not closed = unexpected exit
             store.update_session_status(session.task_id, "failed")
         elif session.idle_seconds > IDLE_NUDGE_THRESHOLD:
-            # Worker still alive but idle too long — nudge to close task
+            # Worker still alive but idle too long — nudge once, then reset
+            # the idle timer so we don't spam the same nudge every status check
             target = session.tmux_target
             try:
                 tmux.send_command(
@@ -433,5 +434,6 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
                     f"You appear idle. If you are done, close your task NOW: "
                     f"`bd close {session.task_id} --reason \"<summary>\"`",
                 )
+                store.touch_session(session.task_id)
             except RuntimeError:
                 pass
