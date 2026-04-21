@@ -34,6 +34,7 @@ from rich.panel import Panel
 from mayushii.store import Store, MessageDirection
 from mayushii import tmux, lifecycle, skills
 from mayushii.hooks import handle_session_start, handle_heartbeat, handle_stop, _beads_env
+from mayushii.lifecycle import validate_task_id, validate_model, validate_role, VALID_MODELS
 
 app = typer.Typer(name="mayushii", help="Mayushii — AI Agent Orchestrator — beads + tmux + Claude Code")
 worker_app = typer.Typer(name="worker", help="Manage worker agents")
@@ -62,6 +63,7 @@ def start(
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't auto-attach to tmux"),
 ) -> None:
     """Start the orchestrator — creates tmux session, launches Claude Code, and attaches you."""
+    validate_model(model)
     existing = store.get_active_orchestrator()
     if existing and tmux.session_exists(existing.tmux_session):
         console.print(f"[yellow]Orchestrator already running, attaching...[/]")
@@ -332,6 +334,10 @@ def worker_send(
     msg_type: str = typer.Option("nudge", "--type", "-t", help="Message type: nudge|status|normal|divert"),
 ) -> None:
     """Send a message to a worker."""
+    valid_types = {"nudge", "status", "normal", "divert"}
+    if msg_type not in valid_types:
+        console.print(f"[red]Invalid message type '{msg_type}'. Must be one of: {', '.join(sorted(valid_types))}[/]")
+        raise typer.Exit(1)
     lifecycle.send_message(store, task_id, msg_type, message)
     console.print(f"[green]Sent {msg_type} to {task_id}[/]")
 

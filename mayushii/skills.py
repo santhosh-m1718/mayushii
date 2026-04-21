@@ -170,6 +170,9 @@ def inject_skills(workspace: Path, skill_names: list[str], skills_repo: Path | N
             print(f"[mayushii] WARNING: skill '{name}' escapes skills repo, skipping", file=sys.stderr)
             continue
         dst = skills_dir / name
+        if not dst.resolve().parent == skills_dir.resolve() or ".." in name:
+            print(f"[mayushii] WARNING: skill '{name}' would escape skills dir, skipping", file=sys.stderr)
+            continue
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         dst.symlink_to(src)
