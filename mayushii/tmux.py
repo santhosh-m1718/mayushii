@@ -99,15 +99,30 @@ def list_windows(session: str) -> list[Window]:
 
 
 def send_keys(target: str, text: str, enter: bool = True) -> None:
-    """Type text into a tmux pane. The primary communication channel."""
-    _run(["send-keys", "-t", target, "-l", text])
+    """Type text into a tmux pane. The primary communication channel.
+
+    Raises RuntimeError if the target window doesn't exist or tmux rejects the command.
+    """
+    result = _run(["send-keys", "-t", target, "-l", text])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tmux send-keys failed for target '{target}': {result.stderr.strip()}"
+        )
     if enter:
-        _run(["send-keys", "-t", target, "Enter"])
+        result = _run(["send-keys", "-t", target, "Enter"])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"tmux send-keys Enter failed for target '{target}': {result.stderr.strip()}"
+            )
 
 
 def send_interrupt(target: str) -> None:
     """Send Ctrl-C to interrupt the current process."""
-    _run(["send-keys", "-t", target, "C-c"])
+    result = _run(["send-keys", "-t", target, "C-c"])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tmux send-keys C-c failed for target '{target}': {result.stderr.strip()}"
+        )
 
 
 def capture_pane(target: str, lines: int = 50) -> str:
@@ -134,6 +149,23 @@ def wait_for_ready(target: str, sentinel: str = "❯", timeout: int = 30) -> boo
     return False
 
 
+def verify_target(target: str) -> None:
+    """Check that a tmux target (session:window) exists. Raises RuntimeError if not."""
+    parts = target.split(":", 1)
+    sess = parts[0]
+    if not session_exists(sess):
+        raise RuntimeError(f"tmux session '{sess}' does not exist")
+    if len(parts) > 1:
+        window = parts[1]
+        windows = {w.name for w in list_windows(sess)}
+        if window not in windows:
+            raise RuntimeError(
+                f"tmux window '{window}' not found in session '{sess}' "
+                f"(available: {', '.join(sorted(windows)) or 'none'})"
+            )
+
+
 def send_command(target: str, text: str) -> None:
-    """Send a command (text + Enter). Alias for clarity."""
+    """Send a command (text + Enter). Verifies target exists first."""
+    verify_target(target)
     send_keys(target, text, enter=True)

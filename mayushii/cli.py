@@ -73,15 +73,10 @@ def start(
     default_repo_file = Path.home() / ".mayushii" / "default-repo"
     if repo:
         repo_path = Path(repo).resolve()
-        # Remember for next time
-        default_repo_file.parent.mkdir(parents=True, exist_ok=True)
-        default_repo_file.write_text(str(repo_path))
-    elif default_repo_file.exists():
-        repo_path = Path(default_repo_file.read_text().strip())
     else:
-        console.print("[red]No repo specified. Run with --repo /path/to/repo first time.[/]")
-        console.print("[dim]Subsequent runs will remember the path.[/]")
-        raise typer.Exit(1)
+        repo_path = Path(__file__).parent.parent.resolve()
+    default_repo_file.parent.mkdir(parents=True, exist_ok=True)
+    default_repo_file.write_text(str(repo_path))
 
     if not repo_path.exists():
         console.print(f"[red]Repo path does not exist: {repo_path}[/]")
@@ -121,7 +116,8 @@ def start(
         f"## Target Repository\n"
         f"You are running in: `{repo_path}`\n"
         f"All `bd` commands work from this directory.\n"
-        f"When launching workers, ALWAYS pass `--repo {repo_path}`.\n\n"
+        f"Workers auto-resolve repos from `{repo_path}/repos/`. No --repo flag needed.\n"
+        f"If multiple repos in repos/, use `--repo-name <name>`.\n\n"
         f"{orch_skill_content}\n"
     )
 
@@ -260,7 +256,7 @@ def stalls(
         target = f"{orch.tmux_session}:orchestrator"
         try:
             tmux.send_command(target, f"[Worker {s.task_id}]: stalled — no activity for {idle_min} minutes")
-        except Exception:
+        except RuntimeError:
             pass
 
 
@@ -276,6 +272,7 @@ def worker_start(
     context: str = typer.Option("", "--context", "-c", help="Context from prior tasks"),
     prompt: str = typer.Option("", "--prompt", "-p", help="Custom initial prompt"),
     repo: str = typer.Option("", "--repo", help="Repository path to work in"),
+    repo_name: str = typer.Option("", "--repo-name", help="Repo name in repos/ directory"),
     auto_skills: bool = typer.Option(False, "--auto-skills", help="LLM-select skills automatically"),
 ) -> None:
     """Launch a worker agent in a tmux window."""
@@ -306,6 +303,7 @@ def worker_start(
         context=context,
         prompt=prompt or None,
         repo_path=repo or None,
+        repo_name=repo_name or None,
     )
 
     console.print(Panel(
@@ -338,7 +336,11 @@ def worker_send(
     if msg_type not in valid_types:
         console.print(f"[red]Invalid message type '{msg_type}'. Must be one of: {', '.join(sorted(valid_types))}[/]")
         raise typer.Exit(1)
-    lifecycle.send_message(store, task_id, msg_type, message)
+    try:
+        lifecycle.send_message(store, task_id, msg_type, message)
+    except RuntimeError as e:
+        console.print(f"[red]Failed to send {msg_type} to {task_id}: {e}[/]")
+        raise typer.Exit(1)
     console.print(f"[green]Sent {msg_type} to {task_id}[/]")
 
 
@@ -410,8 +412,9 @@ def crew_ask(
         target = f"{orch.tmux_session}:orchestrator"
         try:
             tmux.send_command(target, f"[Worker {task_id} asks]: {question}")
-        except Exception:
-            pass
+        except RuntimeError as e:
+            console.print(f"[yellow]Warning: could not deliver to orchestrator tmux: {e}[/]")
+            console.print(f"[dim]Question stored in DB — orchestrator can retrieve it via status check[/]")
 
     console.print(f"[green]Question sent to orchestrator.[/]")
 

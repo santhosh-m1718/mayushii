@@ -21,6 +21,7 @@ from mayushii.hooks import write_workspace_settings, write_worker_prompt, cleanu
 
 MAYUSHII_HOME = Path.home() / ".mayushii"
 WORKSPACES_DIR = MAYUSHII_HOME / "workspaces"
+REPOS_DIR = MAYUSHII_HOME / "repos"
 
 VALID_ROLES = {"explore", "plan", "edit", "verify"}
 
@@ -70,8 +71,51 @@ def _get_repo_path() -> Path:
     return Path(__file__).parent.parent
 
 
+def _get_mayushii_root() -> Path:
+    """Return the mayushii package root (the installed repo directory)."""
+    return Path(__file__).parent.parent
+
+
+def _get_repos_dir() -> Path:
+    """Return ~/.mayushii/repos/ — where user repos are symlinked or cloned."""
+    return REPOS_DIR
+
+
+def resolve_worker_repo(repo_name: str | None = None) -> Path | None:
+    """Resolve a repo path from ~/.mayushii/repos/.
+
+    - If repo_name given: return repos/<repo_name>, raise if not found.
+    - If no repo_name: auto-detect — return the single repo if exactly one exists,
+      raise if multiple exist (ambiguous), return None if repos/ is empty or missing.
+    """
+    repos_dir = _get_repos_dir()
+
+    if repo_name:
+        candidate = repos_dir / repo_name
+        if not candidate.exists():
+            raise ValueError(
+                f"Repo '{repo_name}' not found in {repos_dir}. "
+                f"Symlink or clone it there first."
+            )
+        return candidate.resolve()
+
+    if not repos_dir.exists():
+        return None
+
+    entries = [p for p in repos_dir.iterdir() if p.is_dir() or p.is_symlink()]
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return entries[0].resolve()
+    names = ", ".join(sorted(p.name for p in entries))
+    raise ValueError(
+        f"Multiple repos found in {repos_dir}: {names}. "
+        f"Specify one with --repo-name."
+    )
+
+
 def _get_roles_dir() -> Path:
-    return _get_repo_path() / "roles"
+    return _get_mayushii_root() / "roles"
 
 MAX_TMUX_MESSAGE_LEN = 4096
 
@@ -101,13 +145,13 @@ def create_workspace(task_id: str) -> Path:
     return workspace
 
 
-DEFAULT_WORKER_MODEL = "claude-sonnet-4-6"
+DEFAULT_WORKER_MODEL = "claude-opus-4-6"
 
 ROLE_MODELS = {
-    "explore": "claude-sonnet-4-6",
-    "plan": "claude-sonnet-4-6",
-    "edit": "claude-sonnet-4-6",
-    "verify": "claude-sonnet-4-6",
+    "explore": "claude-opus-4-6",
+    "plan": "claude-opus-4-6",
+    "edit": "claude-opus-4-6",
+    "verify": "claude-opus-4-6",
 }
 
 
@@ -121,6 +165,7 @@ def start_worker(
     context: str = "",
     prompt: str | None = None,
     repo_path: str | None = None,
+    repo_name: str | None = None,
     model: str | None = None,
 ) -> Session:
     """Launch a worker agent in a tmux window.
@@ -144,11 +189,15 @@ def start_worker(
         model = ROLE_MODELS.get(role, DEFAULT_WORKER_MODEL)
     validate_model(model)
 
-    # Workspace setup — if repo_path given, work there instead
+    # Workspace resolution: explicit repo_path > repo_name > repos/ auto-detect > managed workspace
     if repo_path:
         workspace = Path(repo_path)
     else:
-        workspace = create_workspace(task_id)
+        resolved = resolve_worker_repo(repo_name)
+        if resolved:
+            workspace = resolved
+        else:
+            workspace = create_workspace(task_id)
 
     # Inject skills
     skills_repo = discover_skills_repo()
@@ -227,7 +276,10 @@ def stop_worker(store: Store, task_id: str, cleanup: bool = True) -> None:
     if tmux.session_exists(session.tmux_session):
         windows = {w.name for w in tmux.list_windows(session.tmux_session)}
         if session.window_name in windows:
-            tmux.send_interrupt(target)
+            try:
+                tmux.send_interrupt(target)
+            except RuntimeError:
+                pass
             import time
             time.sleep(3)
             tmux.kill_window(session.tmux_session, session.window_name)
@@ -269,6 +321,18 @@ def send_message(
     # Truncate oversized messages that could overflow tmux
     if len(content) > MAX_TMUX_MESSAGE_LEN:
         content = content[:MAX_TMUX_MESSAGE_LEN] + "\n... [truncated]"
+
+    # Verify the worker's tmux window exists before attempting to send
+    if not tmux.session_exists(session.tmux_session):
+        raise RuntimeError(
+            f"Cannot send to {task_id}: tmux session '{session.tmux_session}' is gone"
+        )
+    windows = {w.name for w in tmux.list_windows(session.tmux_session)}
+    if session.window_name not in windows:
+        raise RuntimeError(
+            f"Cannot send to {task_id}: tmux window '{session.window_name}' is gone "
+            f"(worker may have exited)"
+        )
 
     if msg_type == "nudge":
         tmux.send_command(target, content)
@@ -363,8 +427,11 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
         elif session.idle_seconds > IDLE_NUDGE_THRESHOLD:
             # Worker still alive but idle too long — nudge to close task
             target = session.tmux_target
-            tmux.send_command(
-                target,
-                f"You appear idle. If you are done, close your task NOW: "
-                f"`bd close {session.task_id} --reason \"<summary>\"`",
-            )
+            try:
+                tmux.send_command(
+                    target,
+                    f"You appear idle. If you are done, close your task NOW: "
+                    f"`bd close {session.task_id} --reason \"<summary>\"`",
+                )
+            except RuntimeError:
+                pass

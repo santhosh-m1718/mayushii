@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mayushii.store import Store
+from mayushii.store import Store, MessageDirection
 
 
 _TASK_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -273,17 +273,25 @@ def handle_stop(task_id: str) -> None:
     if not store.try_terminal_transition(task_id, status):
         return
 
-    # Signal orchestrator via tmux — critical path, don't silently swallow failures
-    if session.orchestrator_id:
-        orch = store.get_orchestrator(session.orchestrator_id)
-        if orch:
-            from mayushii import tmux
-            target = f"{orch.tmux_session}:orchestrator"
-            if tmux.session_exists(orch.tmux_session):
-                windows = {w.name for w in tmux.list_windows(orch.tmux_session)}
-                if "orchestrator" in windows:
-                    tmux.send_command(target, f"[Worker {task_id}]: {status} — {reason}")
-                else:
-                    print(f"[mayushii] WARNING: orchestrator window gone, completion signal for {task_id} lost", file=sys.stderr)
-            else:
-                print(f"[mayushii] WARNING: tmux session {orch.tmux_session} gone, completion signal for {task_id} lost", file=sys.stderr)
+    # Signal orchestrator via tmux
+    if not session.orchestrator_id:
+        return
+
+    orch = store.get_orchestrator(session.orchestrator_id)
+    if not orch:
+        print(f"[mayushii] WARNING: orchestrator record not found for {task_id}", file=sys.stderr)
+        return
+
+    from mayushii import tmux
+    target = f"{orch.tmux_session}:orchestrator"
+    signal = f"[Worker {task_id}]: {status} — {reason}"
+
+    try:
+        tmux.send_command(target, signal)
+    except RuntimeError as e:
+        print(f"[mayushii] WARNING: failed to signal orchestrator for {task_id}: {e}", file=sys.stderr)
+        # Fall back: store the signal as a pending message so orchestrator can poll for it
+        try:
+            store.put_message(task_id, MessageDirection.TO_ORCHESTRATOR, "signal", signal)
+        except Exception:
+            pass
