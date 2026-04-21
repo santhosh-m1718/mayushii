@@ -33,6 +33,7 @@ def _run(args: list[str], check: bool = False) -> subprocess.CompletedProcess[st
         capture_output=True,
         text=True,
         check=check,
+        timeout=10,
     )
 
 
@@ -118,11 +119,15 @@ def capture_pane(target: str, lines: int = 50) -> str:
 def wait_for_ready(target: str, sentinel: str = "❯", timeout: int = 30) -> bool:
     """Poll pane output until sentinel appears or timeout.
 
-    Better than sleep(3) — detects when Claude Code is actually ready.
+    Clears scrollback first to avoid matching stale content from before
+    the command was launched.
     """
+    _run(["send-keys", "-t", target, "clear", "Enter"])
+    time.sleep(0.5)
+    _run(["clear-history", "-t", target])
     deadline = time.time() + timeout
     while time.time() < deadline:
-        output = capture_pane(target, lines=5)
+        output = capture_pane(target, lines=10)
         if sentinel in output:
             return True
         time.sleep(1)

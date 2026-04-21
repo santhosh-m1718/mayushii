@@ -15,6 +15,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Generator
 
+from . import tmux as _tmux
+
 
 MAYUSHII_HOME = Path.home() / ".mayushii"
 DB_PATH = MAYUSHII_HOME / "mayushii.db"
@@ -151,6 +153,7 @@ class Store:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
@@ -173,6 +176,16 @@ class Store:
                 "SELECT id FROM orchestrators WHERE tmux_session = ?", (tmux_session,)
             ).fetchone()
             if old:
+                # Kill orphaned tmux windows before removing from DB
+                old_sessions = conn.execute(
+                    "SELECT tmux_session, window_name FROM sessions WHERE orchestrator_id = ? AND status IN ('starting', 'running')",
+                    (old["id"],),
+                ).fetchall()
+                for s in old_sessions:
+                    try:
+                        _tmux.kill_window(s["tmux_session"], s["window_name"])
+                    except Exception:
+                        pass
                 # Stop any active sessions
                 conn.execute(
                     "UPDATE sessions SET status = 'stopped', stopped_at = ? WHERE orchestrator_id = ? AND status IN ('starting', 'running')",

@@ -22,6 +22,45 @@ from mayushii.hooks import write_workspace_settings, write_worker_prompt, cleanu
 MAYUSHII_HOME = Path.home() / ".mayushii"
 WORKSPACES_DIR = MAYUSHII_HOME / "workspaces"
 
+VALID_ROLES = {"explore", "plan", "edit", "verify"}
+
+VALID_MODELS = {
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-haiku-4-5-20251001",
+}
+
+_TASK_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def validate_task_id(task_id: str) -> str:
+    """Validate task_id is safe for use in paths and shell commands."""
+    if not _TASK_ID_RE.match(task_id):
+        raise ValueError(
+            f"Invalid task_id '{task_id}': must be alphanumeric with hyphens/dots/underscores, max 64 chars"
+        )
+    if ".." in task_id or "/" in task_id or "\\" in task_id:
+        raise ValueError(f"Invalid task_id '{task_id}': path traversal characters not allowed")
+    return task_id
+
+
+def validate_model(model: str) -> str:
+    """Validate model against allowlist to prevent command injection."""
+    if model not in VALID_MODELS:
+        raise ValueError(
+            f"Invalid model '{model}'. Must be one of: {', '.join(sorted(VALID_MODELS))}"
+        )
+    return model
+
+
+def validate_role(role: str) -> str:
+    """Validate role against known roles."""
+    if role not in VALID_ROLES:
+        raise ValueError(
+            f"Invalid role '{role}'. Must be one of: {', '.join(sorted(VALID_ROLES))}"
+        )
+    return role
+
 
 def _get_repo_path() -> Path:
     """Get the repo path from stored config."""
@@ -45,6 +84,7 @@ def _sanitize_window_name(name: str) -> str:
 
 def _load_role_prompt(role: str) -> str:
     """Load a role prompt template from roles/<role>.md"""
+    validate_role(role)
     role_file = _get_roles_dir() / f"{role}.md"
     if role_file.exists():
         return role_file.read_text()
@@ -53,7 +93,10 @@ def _load_role_prompt(role: str) -> str:
 
 def create_workspace(task_id: str) -> Path:
     """Create an isolated workspace directory for a worker."""
+    validate_task_id(task_id)
     workspace = WORKSPACES_DIR / task_id
+    if not workspace.resolve().is_relative_to(WORKSPACES_DIR.resolve()):
+        raise ValueError(f"Task ID '{task_id}' would escape workspaces directory")
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace
 
@@ -92,9 +135,14 @@ def start_worker(
     7. Launch Claude Code
     8. Wait for ready, then send initial prompt
     """
+    # Validate inputs
+    validate_task_id(task_id)
+    validate_role(role)
+
     # Pick model: explicit > role default > global default
     if not model:
         model = ROLE_MODELS.get(role, DEFAULT_WORKER_MODEL)
+    validate_model(model)
 
     # Workspace setup — if repo_path given, work there instead
     if repo_path:
@@ -136,7 +184,7 @@ def start_worker(
     tmux.wait_for_ready(target, sentinel="%", timeout=3)
 
     # Explicitly cd into workspace (shell profile may override tmux -c cwd)
-    tmux.send_command(target, f"cd {workspace}")
+    tmux.send_command(target, f'cd "{workspace}"')
 
     # Launch Claude Code with model
     tmux.send_command(target, f"claude --model {model} --dangerously-skip-permissions")
@@ -147,9 +195,12 @@ def start_worker(
     # Update status
     store.update_session_status(task_id, "running")
 
-    # Send initial prompt — tell worker to read its prompt file
+    # Send initial prompt — tell worker to read its prompt file and emphasize closing
     if not prompt:
-        prompt = f"Read {prompt_path} for your instructions, then run `bd show {task_id}`. Begin working."
+        prompt = (
+            f"Read {prompt_path} for your instructions, then run `bd show {task_id}`. Begin working. "
+            f"IMPORTANT: When done, you MUST run `bd close {task_id} --reason \"<summary>\"` to signal completion."
+        )
     tmux.send_command(target, prompt)
 
     return session
@@ -208,9 +259,6 @@ def send_message(
     if len(content) > MAX_TMUX_MESSAGE_LEN:
         content = content[:MAX_TMUX_MESSAGE_LEN] + "\n... [truncated]"
 
-    # Record the message
-    store.put_message(task_id, MessageDirection.TO_WORKER, msg_type, content)
-
     if msg_type == "nudge":
         tmux.send_command(target, content)
 
@@ -228,6 +276,9 @@ def send_message(
 
     else:
         raise ValueError(f"Unknown message type: {msg_type}")
+
+    # Record only after successful send
+    store.put_message(task_id, MessageDirection.TO_WORKER, msg_type, content)
 
 
 def check_worker_output(store: Store, task_id: str, lines: int = 30) -> str:
@@ -250,11 +301,15 @@ def list_workers(store: Store, orchestrator_id: str) -> list[Session]:
     return store.list_sessions(orchestrator_id)
 
 
+IDLE_NUDGE_THRESHOLD = 120  # seconds — nudge worker to close if idle this long
+
+
 def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
     """Sync worker states with actual tmux window state.
 
     If a tmux window is gone but the session is still 'running',
     check beads to determine if it completed or failed.
+    Also nudges idle workers that may have finished but forgot to close.
     """
     sessions = store.list_running_sessions(orchestrator_id)
     if not sessions:
@@ -294,3 +349,11 @@ def refresh_worker_states(store: Store, orchestrator_id: str) -> None:
                 pass
             # Window gone but task not closed = unexpected exit
             store.update_session_status(session.task_id, "failed")
+        elif session.idle_seconds > IDLE_NUDGE_THRESHOLD:
+            # Worker still alive but idle too long — nudge to close task
+            target = session.tmux_target
+            tmux.send_command(
+                target,
+                f"You appear idle. If you are done, close your task NOW: "
+                f"`bd close {session.task_id} --reason \"<summary>\"`",
+            )
